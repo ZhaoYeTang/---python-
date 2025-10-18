@@ -1,159 +1,236 @@
-# nc_to_tiff_qc.py
 # -*- coding: utf-8 -*-
 """
-把 NetCDF 的断点回归结果导出为 GeoTIFF：
-- 输出：tau_ssm, slope_lo, slope_hi, delta_BIC, n_samples, keep_ratio
-- 额外：tau_ssm_qc（按阈值做质控遮罩）
-- CRS: EPSG:4326；压缩：LZW；NoData: -9999
+将 NetCDF(.nc) 中的变量转换为 GeoTIFF(.tif)
+- 在 Python 环境中直接运行（Jupyter/Spyder/PyCharm 等）
+- 使用 tkinter 弹窗选择 nc 文件与输出目录，并输入变量名
+- 自动判断是否包含时间维：有 -> 按时间逐一输出，多张；无 -> 输出单张
 """
 
 import os
+import warnings
+from typing import Optional, Tuple, List
+
 import numpy as np
 import xarray as xr
+import rioxarray
+import pandas as pd
 
-# ========= 路径与参数（改这里） =========
-IN_NC   = r"E:\southWestern-dongmeng\breakpoint\GPP_SSM_breakpoint_2024_ROI.nc"  # 你刚生成的结果
-OUT_DIR = r"E:\southWestern-dongmeng\breakpoint\2024"                      # 输出文件夹
-VARS    = ["tau_ssm", "slope_lo", "slope_hi", "delta_BIC", "n_samples", "keep_ratio"]
-FILL    = -9999.0
-# 质控阈值（用于 tau_ssm_qc）
-MIN_SAMPLES   = 12
-MIN_DELTA_BIC = 10.0
-# =====================================
+# ===== 可选：简单 GUI 选择 =====
+try:
+    import tkinter as tk
+    from tkinter import filedialog, simpledialog, messagebox
+    _HAS_TK = True
+except Exception:
+    _HAS_TK = False
 
-def get_geotransform_from_latlon(lat, lon):
-    """根据 1D lat/lon（中心点坐标）构造 GeoTransform（西北角为原点；north-up）"""
-    lat = np.asarray(lat); lon = np.asarray(lon)
-    # 分辨率（假设等间距）
-    dx = float(np.abs(lon[1] - lon[0]))
-    dy = float(np.abs(lat[1] - lat[0]))
-    # 目标要求：数组的第 0 行是“北边” → 若当前 lat 升序（南→北），我们写之前要 flipud
-    # GeoTransform 采用像元外框 → 左上角坐标：
-    xmin = float(lon.min() - dx/2.0)
-    ymax = float(lat.max() + dy/2.0)
-    return xmin, dx, 0.0, ymax, 0.0, -dy  # (GT[0], GT[1], GT[2], GT[3], GT[4], GT[5])
 
-def write_tiff_rasterio(path, arr2d, gt, nodata, dtype):
-    import rasterio
-    from rasterio.transform import Affine
-    xmin, dx, _, ymax, _, neg_dy = gt
-    transform = Affine.translation(xmin, ymax) * Affine.scale(dx, neg_dy)  # neg_dy为负
-    profile = {
-        "driver": "GTiff",
-        "height": arr2d.shape[0],
-        "width":  arr2d.shape[1],
-        "count":  1,
-        "dtype":  dtype,
-        "crs":    "EPSG:4326",
-        "transform": transform,
-        "tiled": True,
-        "compress": "LZW",
-        "predictor": 2 if np.issubdtype(np.dtype(dtype), np.floating) else 1,
-        "nodata": nodata,
-        "BIGTIFF": "IF_SAFER",
-    }
-    # 将 NaN 替换为 nodata
-    out = np.where(np.isfinite(arr2d), arr2d, nodata).astype(dtype, copy=False)
-    with rasterio.open(path, "w", **profile) as dst:
-        dst.write(out, 1)
+def _find_lat_lon_dims(da: xr.DataArray) -> Tuple[str, str]:
+    """尽量稳健地在 DataArray 的维度/坐标里找到纬度和经度维名。"""
+    cand_lat = ["lat", "latitude", "y"]
+    cand_lon = ["lon", "longitude", "x"]
 
-def write_tiff_gdal(path, arr2d, gt, nodata, dtype):
-    from osgeo import gdal, osr
-    gdal.UseExceptions()
-    dtype_map = {
-        "float32": gdal.GDT_Float32,
-        "float64": gdal.GDT_Float64,
-        "int16":   gdal.GDT_Int16,
-        "int32":   gdal.GDT_Int32,
-        "uint8":   gdal.GDT_Byte,
-    }
-    gdal_dtype = dtype_map.get(str(np.dtype(dtype)))
-    if gdal_dtype is None:
-        gdal_dtype = gdal.GDT_Float32
-    driver = gdal.GetDriverByName("GTiff")
-    ny, nx = arr2d.shape
-    ds = driver.Create(path, nx, ny, 1, gdal_dtype,
-                       options=["TILED=YES","COMPRESS=LZW","PREDICTOR=2","BIGTIFF=IF_SAFER"])
-    ds.SetGeoTransform(gt)
-    srs = osr.SpatialReference(); srs.ImportFromEPSG(4326)
-    ds.SetProjection(srs.ExportToWkt())
-    band = ds.GetRasterBand(1)
-    band.SetNoDataValue(float(nodata))
-    out = np.where(np.isfinite(arr2d), arr2d, nodata).astype(dtype, copy=False)
-    band.WriteArray(out)
-    band.FlushCache()
-    ds.FlushCache()
-    ds = None
+    # 先在 dims 里找
+    lat_name = next((d for d in da.dims if d.lower() in cand_lat), None)
+    lon_name = next((d for d in da.dims if d.lower() in cand_lon), None)
 
-def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    ds = xr.open_dataset(IN_NC, decode_times=True, mask_and_scale=True)
+    # 再在 coords 里找
+    if lat_name is None:
+        lat_name = next((c for c in da.coords if c.lower() in cand_lat), None)
+    if lon_name is None:
+        lon_name = next((c for c in da.coords if c.lower() in cand_lon), None)
 
-    # 基础检查
-    for v in VARS:
-        if v not in ds:
-            raise KeyError(f"变量 {v} 不在 {IN_NC} 中。可用变量：{list(ds.data_vars)}")
-    lat = ds["lat"].values
-    lon = ds["lon"].values
-    # 计算 geotransform；并把数组翻到“北在上”
-    gt = get_geotransform_from_latlon(lat, lon)
-    flip_needed = True  # 你的 lat 通常是升序（南→北），必须 flipud 才是 north-up
-    # 选择写驱动
+    if lat_name is None or lon_name is None:
+        raise ValueError(
+            f"未找到经纬度维度/坐标。检测到的维度: {list(da.dims)}, 坐标: {list(da.coords)}\n"
+            f"请确认数据含有 lat/lon 或 latitude/longitude 或 x/y 等。"
+        )
+    return lat_name, lon_name
+
+
+def _find_time_dim(da: xr.DataArray) -> Optional[str]:
+    """返回时间维名称（如存在）。"""
+    for d in da.dims:
+        dl = d.lower()
+        if ("time" in dl) or (dl in ["t", "month", "date"]):
+            return d
+    return None
+
+
+def _format_time_label(val: np.datetime64) -> str:
+    """时间标签：YYYYMMDD 或 YYYYMM（如果是月尺度也能兼容）。"""
+    ts = pd.to_datetime(val)
+    # 若是月尺度、只有月末日期，可输出 YYYYMM
+    if ts.day in (28, 29, 30, 31):  # 不严格判断，直接给 YYYYMM 更通用
+        return ts.strftime("%Y%m")
+    return ts.strftime("%Y%m%d")
+
+
+def _ensure_crs_and_dims(da: xr.DataArray, lon_name: str, lat_name: str):
+    """设置空间维并写入 WGS84 坐标系。"""
+    # 如果是坐标在 coords 里但不在 dims 里，确保 DataArray 是二维网格
+    if lon_name not in da.dims or lat_name not in da.dims:
+        # 常见于经纬度在 coords，数据 dims 是（y, x）且 coords 关联
+        pass
+    # 设置空间维
+    da = da.rio.set_spatial_dims(x_dim=lon_name, y_dim=lat_name, inplace=False)
+    # 写 CRS
+    if not da.rio.crs:
+        da = da.rio.write_crs("EPSG:4326", inplace=False)
+    return da
+
+
+def convert_nc_to_tiff(
+    nc_path: str,
+    var_name: str,
+    output_dir: Optional[str] = None,
+    nodata: Optional[float] = None,
+    dtype: Optional[str] = None,
+) -> List[str]:
+    """
+    将指定 nc 文件中的变量转换为 GeoTIFF。
+    返回生成的文件路径列表。
+
+    参数
+    ----
+    nc_path : str
+        .nc 文件路径
+    var_name : str
+        变量名
+    output_dir : str, optional
+        输出文件夹；默认与 nc 同级
+    nodata : float, optional
+        指定输出 GeoTIFF 的 NoData 值（默认不强制写）
+    dtype : str, optional
+        强制输出数据类型（如 'float32', 'int16'）；默认保持原 dtype
+    """
+    if output_dir is None or output_dir.strip() == "":
+        output_dir = os.path.dirname(nc_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        ds = xr.open_dataset(nc_path)
+
+    if var_name not in ds.variables:
+        raise ValueError(
+            f"变量 '{var_name}' 不存在。可选变量：\n{list(ds.variables)}"
+        )
+
+    da = ds[var_name]
+
+    # 尝试解码缩放与偏移（如果有）
+    # xarray 会自动解码 CF 标准的 scale_factor/add_offset；若未生效，这里显式触发
+    if "scale_factor" in da.encoding or "add_offset" in da.encoding:
+        da = xr.decode_cf(xr.Dataset({var_name: da}))[var_name]
+
+    # 找经纬度维名
+    lat_name, lon_name = _find_lat_lon_dims(da)
+
+    # 找时间维（可无）
+    time_dim = _find_time_dim(da)
+
+    # 准备输出
+    out_paths = []
+
+    if time_dim is None:
+        # 无时间维：输出一张
+        da2 = _ensure_crs_and_dims(da.squeeze(drop=True), lon_name, lat_name)
+        if nodata is not None:
+            da2 = da2.rio.write_nodata(nodata, inplace=False)
+        if dtype:
+            da2 = da2.astype(dtype)
+
+        out_path = os.path.join(output_dir, f"{var_name}.tif")
+        da2.rio.to_raster(out_path)
+        out_paths.append(out_path)
+
+    else:
+        # 有时间维：逐一输出
+        for t in da[time_dim].values:
+            slice_da = da.sel({time_dim: t}).squeeze(drop=True)
+            slice_da = _ensure_crs_and_dims(slice_da, lon_name, lat_name)
+            if nodata is not None:
+                slice_da = slice_da.rio.write_nodata(nodata, inplace=False)
+            if dtype:
+                slice_da = slice_da.astype(dtype)
+
+            t_str = _format_time_label(t)
+            out_path = os.path.join(output_dir, f"{var_name}_{t_str}.tif")
+            slice_da.rio.to_raster(out_path)
+            out_paths.append(out_path)
+
+    ds.close()
+    return out_paths
+
+
+# ===== 下面是“无需终端”的可视化交互（可选）=====
+def run_with_gui():
+    if not _HAS_TK:
+        raise RuntimeError("本机未安装 tkinter，无法使用图形界面。可直接在代码里调用 convert_nc_to_tiff(...)。")
+
+    root = tk.Tk()
+    root.withdraw()
+
+    messagebox.showinfo("nc -> GeoTIFF", "请选择一个 .nc 文件")
+    nc_path = filedialog.askopenfilename(
+        title="选择 .nc 文件",
+        filetypes=[("NetCDF", "*.nc"), ("所有文件", "*.*")]
+    )
+    if not nc_path:
+        messagebox.showwarning("取消", "未选择文件。")
+        return
+
+    # 打开数据并列出变量，提示输入
+    ds = xr.open_dataset(nc_path)
+    var_list = list(ds.variables)
+    ds.close()
+
+    var_tip = "可选变量：\n- " + "\n- ".join(var_list)
+    var_name = simpledialog.askstring("变量名", f"请输入需要转换的变量名：\n\n{var_tip}")
+    if not var_name:
+        messagebox.showwarning("取消", "未输入变量名。")
+        return
+
+    messagebox.showinfo("输出目录", "请选择输出文件夹")
+    output_dir = filedialog.askdirectory(title="选择输出文件夹")
+    if not output_dir:
+        # 若未选则默认与 nc 同目录
+        output_dir = os.path.dirname(nc_path)
+
+    # 可选：设置 NoData 和 dtype
+    nodata_str = simpledialog.askstring("NoData（可留空）", "为 GeoTIFF 设置 NoData 值（例如 -9999），留空表示不设置：")
+    nodata = float(nodata_str) if nodata_str and nodata_str.strip() != "" else None
+
+    dtype = simpledialog.askstring("输出数据类型（可留空）", "如需强制输出 dtype，请输入（例如 float32、int16）。留空表示保持原始类型：")
+    dtype = dtype.strip() if dtype else None
+
     try:
-        import rasterio  # noqa
-        use_rasterio = True
-    except Exception:
-        use_rasterio = False
+        paths = convert_nc_to_tiff(nc_path, var_name, output_dir, nodata=nodata, dtype=dtype)
+        msg = "转换完成！\n\n输出文件：\n" + "\n".join(paths)
+        messagebox.showinfo("成功", msg)
+    except Exception as e:
+        messagebox.showerror("错误", str(e))
 
-    def _write_one(varname, dtype="float32"):
-        arr = ds[varname].values  # (lat, lon)
-        if flip_needed:
-            arr = np.flipud(arr)
-        out_path = os.path.join(OUT_DIR, f"{varname}.tif")
-        if use_rasterio:
-            write_tiff_rasterio(out_path, arr, gt, FILL, dtype)
-        else:
-            write_tiff_gdal(out_path, arr, gt, FILL, dtype)
-        print("写出：", out_path)
 
-    # 主变量
-    _write_one("tau_ssm",    dtype="float32")
-    _write_one("slope_lo",   dtype="float32")
-    _write_one("slope_hi",   dtype="float32")
-    _write_one("delta_BIC",  dtype="float32")
-    # n_samples 可能是整型
-    ns = ds["n_samples"].astype("int16").values
-    if flip_needed: ns = np.flipud(ns)
-    out_ns = os.path.join(OUT_DIR, "n_samples.tif")
-    if use_rasterio:
-        write_tiff_rasterio(out_ns, ns, gt, -32768, "int16")
-    else:
-        write_tiff_gdal(out_ns, ns, gt, -32768, "int16")
-    print("写出：", out_ns)
-    # keep_ratio
-    _write_one("keep_ratio", dtype="float32")
-
-    # 质控版 tau（可调 MIN_SAMPLES、MIN_DELTA_BIC）
-    good = (ds["n_samples"] >= MIN_SAMPLES) & (ds["delta_BIC"] > MIN_DELTA_BIC)
-    tau_qc = ds["tau_ssm"].where(good).values
-    if flip_needed:
-        tau_qc = np.flipud(tau_qc)
-    out_qc = os.path.join(OUT_DIR, f"tau_ssm_qc_ns{MIN_SAMPLES}_dbic{int(MIN_DELTA_BIC)}.tif")
-    if use_rasterio:
-        write_tiff_rasterio(out_qc, tau_qc, gt, FILL, "float32")
-    else:
-        write_tiff_gdal(out_qc, tau_qc, gt, FILL, "float32")
-    print("写出：", out_qc)
-
-    # 可选：为所有浮点图层写一个 0–1 有效性蒙版（方便 GIS 里快速查看）
-    valid = np.isfinite(ds["tau_ssm"].values).astype("uint8")
-    if flip_needed: valid = np.flipud(valid)
-    out_valid = os.path.join(OUT_DIR, "valid_mask.tif")
-    if use_rasterio:
-        write_tiff_rasterio(out_valid, valid, gt, 0, "uint8")
-    else:
-        write_tiff_gdal(out_valid, valid, gt, 0, "uint8")
-    print("写出：", out_valid)
-
+# ===== 使用示例 =====
 if __name__ == "__main__":
-    main()
+    """
+    方式 A：直接在代码里调用（完全不需要终端交互）
+        convert_nc_to_tiff(
+            nc_path=r"E:\path\to\your.nc",
+            var_name="Et",
+            output_dir=r"E:\path\to\out",
+            nodata=-9999,
+            dtype="float32"
+        )
+
+    方式 B：使用 GUI 点选（如果你装了 tkinter）
+        run_with_gui()
+    """
+    # 👉 默认走 GUI；如不需要，注释掉下一行，改用“方式 A”示例。
+    if _HAS_TK:
+        run_with_gui()
+    else:
+        # 没有 tkinter 的环境，给出一个最简示例（请修改路径与变量）
+        # convert_nc_to_tiff(r"/path/to/your.nc", "Et", r"/path/to/out", nodata=-9999, dtype="float32")
+        pass
